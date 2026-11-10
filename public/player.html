@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZOECONNET Player</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  body.playing { cursor: none; }
+  #stage { position: absolute; inset: 0; overflow: hidden; background: #000; }
+  #stage.rotated { width: 100vh; height: 100vw; inset: auto; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(90deg); }
+  .layer { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+  .layer img, .layer video { width: 100%; height: 100%; object-fit: contain; }
+  .layer iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+  /* Transiciones */
+  .layer.enter { transition-property: opacity, transform, clip-path; transition-timing-function: ease-in-out; }
+  .t-fade.pre { opacity: 0; }
+  .t-slide-left.pre { transform: translateX(100%); }
+  .t-slide-up.pre { transform: translateY(100%); }
+  .t-zoom.pre { opacity: 0; transform: scale(1.15); }
+  .t-reveal-tl.pre { clip-path: circle(0% at 0% 0%); }
+  .t-reveal-br.pre { clip-path: circle(0% at 100% 100%); }
+  .t-wipe.pre { clip-path: inset(0 100% 0 0); }
+  .t-reveal-tl { clip-path: circle(150% at 0% 0%); }
+  .t-reveal-br { clip-path: circle(150% at 100% 100%); }
+  .t-wipe { clip-path: inset(0 0 0 0); }
+
+  .panel { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 5vmin; box-sizing: border-box;
+           background: radial-gradient(circle at 30% 20%, #0f4c5c 0%, #062a33 55%, #031519 100%); }
+  .brand { font-weight: 800; letter-spacing: .08em; font-size: 3vmin; opacity: .85; margin-bottom: 4vmin; }
+  .brand span { color: #f4a261; }
+  .code { font-size: 14vmin; font-weight: 800; letter-spacing: .12em; font-variant-numeric: tabular-nums; background: rgba(255,255,255,.08); border: 2px solid rgba(255,255,255,.18); border-radius: 3vmin; padding: 1vmin 5vmin; }
+  .hint { font-size: 3vmin; opacity: .8; max-width: 70ch; line-height: 1.4; margin-top: 4vmin; }
+  .small { font-size: 2.2vmin; opacity: .6; margin-top: 2vmin; }
+  #fsHint { position: fixed; bottom: 2vmin; right: 2vmin; font-size: 1.8vmin; background: rgba(0,0,0,.6); padding: .8vmin 1.6vmin; border-radius: 1vmin; opacity: .8; transition: opacity 1s; pointer-events: none; }
+  #offline { position: fixed; top: 1.5vmin; right: 1.5vmin; width: 1.6vmin; height: 1.6vmin; border-radius: 50%; background: #e63946; display: none; box-shadow: 0 0 0 .4vmin rgba(0,0,0,.5); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div id="pairing" class="panel hidden">
+  <div class="brand">ZOECONNET <span>SIGNAGE</span></div>
+  <div class="code" id="code">······</div>
+  <div class="hint">Abre el panel de control, ve a <b>Pantallas → Añadir pantalla</b> y escribe este código.</div>
+  <div class="small" id="srv"></div>
+</div>
+
+<div id="empty" class="panel hidden">
+  <div class="brand">ZOECONNET <span>SIGNAGE</span></div>
+  <div class="hint" id="emptyMsg">Pantalla vinculada. Añade contenido a su lista de reproducción desde el panel.</div>
+  <div class="small" id="screenName"></div>
+</div>
+
+<div id="fsHint">Toca o haz doble clic para pantalla completa</div>
+<div id="offline" title="Sin conexión con el servidor"></div>
+
+<script src="/schedule.js"></script>
+<script>
+'use strict';
+const POLL_MS = 15000;
+const TRANSITIONS = ['fade', 'slide-left', 'slide-up', 'zoom', 'reveal-tl', 'reveal-br', 'wipe'];
+const $ = id => document.getElementById(id);
+const stage = $('stage');
+
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) { return null; } }
+
+let deviceId = store('zc_device');
+let state = null;          // última respuesta del servidor
+let signature = '';
+let index = -1;
+let timer = null;
+let current = null;        // capa visible
+let mode = '';             // 'pairing' | 'empty' | 'standby' | 'play'
+
+function show(which) {
+  $('pairing').classList.toggle('hidden', which !== 'pairing');
+  $('empty').classList.toggle('hidden', which !== 'empty');
+  document.body.classList.toggle('playing', which === 'play' || which === 'standby');
+}
+
+async function register() {
+  const r = await fetch('/api/player/register', { method: 'POST' });
+  const j = await r.json();
+  deviceId = j.deviceId; store('zc_device', deviceId);
+  return j;
+}
+
+async function poll() {
+  try {
+    if (!deviceId) await register();
+    const res = `${screen.width}x${screen.height}`;
+    let r = await fetch(`/api/player/${deviceId}?res=${encodeURIComponent(res)}`, { cache: 'no-store' });
+    if (r.status === 404) { store('zc_device', null); deviceId = null; await register(); r = await fetch(`/api/player/${deviceId}`, { cache: 'no-store' }); }
+    const j = await r.json();
+    $('offline').style.display = 'none';
+    if (!j.paired) {
+      state = null; stopPlayback();
+      $('code').textContent = j.code; $('srv').textContent = location.host;
+      mode = 'pairing'; show('pairing');
+      return;
+    }
+    const sig = JSON.stringify([j.playlist, j.screen]);
+    const changed = sig !== signature;
+    signature = sig; state = j;
+    $('stage').classList.toggle('rotated', j.screen.orientation === 'portrait' && innerWidth > innerHeight);
+    $('screenName').textContent = j.screen.name;
+    if (changed || mode === 'pairing' || mode === 'empty' || mode === 'standby') evaluate();
+  } catch (e) {
+    $('offline').style.display = 'block'; // sigue reproduciendo lo último que tenía
+  }
+}
+
+function playable() {
+  if (!state) return [];
+  const now = new Date();
+  return state.playlist.filter(it => Schedule.contentStatus(it, now) === 'active' && Schedule.recurActive(it.recur, now));
+}
+
+// Decide qué hacer según horario y lista
+function evaluate() {
+  if (!state) return;
+  if (!Schedule.withinHours(state.screen.hours)) {
+    if (mode !== 'standby') { stopPlayback(); mode = 'standby'; show('standby'); }
+    return;
+  }
+  const items = playable();
+  if (!items.length) {
+    stopPlayback(); mode = 'empty';
+    $('emptyMsg').textContent = state.playlist.length
+      ? 'No hay contenido programado para este momento.'
+      : 'Pantalla vinculada. Añade contenido a su lista de reproducción desde el panel.';
+    show('empty');
+    return;
+  }
+  if (mode !== 'play') { mode = 'play'; show('play'); index = -1; next(); }
+}
+
+function stopPlayback() {
+  clearTimeout(timer); timer = null;
+  stage.innerHTML = ''; current = null;
+}
+
+function buildLayer(item) {
+  const layer = document.createElement('div');
+  layer.className = 'layer';
+  let el;
+  if (item.type === 'image') { el = document.createElement('img'); el.src = item.url; el.alt = ''; }
+  else if (item.type === 'video') {
+    el = document.createElement('video');
+    el.src = item.url; el.muted = true; el.autoplay = true; el.playsInline = true; el.loop = true; el.preload = 'auto';
+  } else {
+    el = document.createElement('iframe'); el.src = item.url; el.setAttribute('allow', 'autoplay; fullscreen');
+    el.setAttribute('referrerpolicy', 'no-referrer');
+  }
+  layer.appendChild(el);
+  return layer;
+}
+
+function next() {
+  clearTimeout(timer);
+  if (!state) return;
+  if (!Schedule.withinHours(state.screen.hours)) return evaluate();
+  const items = playable();
+  if (!items.length) return evaluate();
+  index = (index + 1) % items.length;
+  const item = items[index];
+  const tr = state.screen.transition || { type: 'fade', speed: 800, web: true };
+  let type = tr.type || 'none';
+  if (type === 'random') type = TRANSITIONS[Math.floor(Math.random() * TRANSITIONS.length)];
+  const useTr = type !== 'none' && current && (tr.web || (item.type !== 'web' && current.dataset.type !== 'web'));
+  const speed = Math.max(100, Number(tr.speed) || 800);
+
+  const layer = buildLayer(item);
+  layer.dataset.type = item.type;
+  const old = current;
+  if (useTr) {
+    layer.classList.add('t-' + type, 'pre');
+    stage.appendChild(layer);
+    layer.getBoundingClientRect(); // fuerza el estado inicial
+    layer.style.transitionDuration = speed + 'ms';
+    layer.classList.add('enter');
+    requestAnimationFrame(() => layer.classList.remove('pre'));
+    setTimeout(() => { if (old && old.parentNode) old.remove(); }, speed + 50);
+  } else {
+    stage.appendChild(layer);
+    if (old) old.remove();
+  }
+  current = layer;
+  const v = layer.querySelector('video');
+  if (v) v.play().catch(() => {});
+  if (items.length === 1 && item.type !== 'video') {
+    // un solo elemento: se queda fijo, se revisa la programación cada duración
+    const recheck = () => {
+      const p = playable();
+      if (p.length !== 1 || p[0].id !== item.id || !Schedule.withinHours(state.screen.hours)) next();
+      else timer = setTimeout(recheck, item.duration * 1000);
+    };
+    timer = setTimeout(recheck, item.duration * 1000);
+    return;
+  }
+  timer = setTimeout(next, Math.max(1, item.duration) * 1000);
+  // precarga la siguiente imagen
+  const nxt = items[(index + 1) % items.length];
+  if (nxt && nxt.type === 'image') { const i = new Image(); i.src = nxt.url; }
+}
+
+// Pantalla completa y mantener la pantalla encendida
+function goFullscreen() {
+  const el = document.documentElement;
+  (el.requestFullscreen || el.webkitRequestFullscreen || (() => {})).call(el);
+  $('fsHint').style.opacity = 0;
+}
+document.addEventListener('dblclick', goFullscreen);
+document.addEventListener('click', () => { if (!document.fullscreenElement) goFullscreen(); });
+setTimeout(() => $('fsHint').style.opacity = 0, 8000);
+async function wakeLock() { try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) {} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') wakeLock(); });
+wakeLock();
+addEventListener('resize', () => { if (state) $('stage').classList.toggle('rotated', state.screen.orientation === 'portrait' && innerWidth > innerHeight); });
+
+poll();
+setInterval(poll, POLL_MS);
+setInterval(evaluate, 30000); // revisa horario y programación aunque no cambie nada
+</script>
+</body>
+</html>
